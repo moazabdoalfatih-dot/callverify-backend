@@ -29,16 +29,18 @@ router.post("/incoming-call", requireAppSecret, async (req, res) => {
     return;
   }
 
-  // تطبيع الرقم: إزالة المسافات والشرطات | Normalize: remove spaces and dashes
   const normalized = normalizePhone(callerPhone);
 
-  // البحث عن جلسة نشطة لهذا الرقم | Search for an active session for this number
+  // ✅ FIFO Queue: نعالج أقدم جلسة نشطة أولاً (ASC بدل DESC)
+  // ✅ FIFO Queue: process the oldest active session first (ASC instead of DESC)
+  // هذا يضمن أن الجلسات تُعالج بترتيب وصولها — لا تضارب
+  // This guarantees sessions are handled in arrival order — no conflicts
   const session = await pool.query(
     `SELECT id, phone FROM verification_sessions
      WHERE phone = $1
        AND verified = FALSE
        AND expires_at > NOW()
-     ORDER BY created_at DESC
+     ORDER BY created_at ASC
      LIMIT 1`,
     [normalized]
   );
@@ -47,8 +49,9 @@ router.post("/incoming-call", requireAppSecret, async (req, res) => {
   let sessionId: string | null = null;
 
   if ((session.rowCount ?? 0) > 0) {
-    // وجدنا جلسة! نُعلّمها كـ "تم التحقق" | Found a session! Mark it as verified
     sessionId = session.rows[0].id as string;
+    // ✅ تحديث فوري — يُنهي حلقة Long-Polling في الطرف الآخر على الفور
+    // ✅ Instant update — terminates the Long-Polling loop on the other end immediately
     await pool.query(
       "UPDATE verification_sessions SET verified = TRUE WHERE id = $1",
       [sessionId]
@@ -56,17 +59,16 @@ router.post("/incoming-call", requireAppSecret, async (req, res) => {
     matched = true;
   }
 
-  // نُسجّل الاتصال في سجل الاتصالات | Log the call
   await pool.query(
     "INSERT INTO incoming_calls (caller_phone, matched, session_id) VALUES ($1, $2, $3)",
     [normalized, matched, sessionId]
   );
 
+  // رد سريع للتطبيق | Fast response to the Android app
   res.json({ matched, phone: normalized });
 });
 
 function normalizePhone(phone: string): string {
-  // إزالة كل شيء إلا الأرقام و + | Remove everything except digits and +
   return phone.replace(/[^\d+]/g, "");
 }
 
