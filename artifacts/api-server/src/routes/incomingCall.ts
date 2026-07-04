@@ -14,7 +14,6 @@
 
 // مسار المكالمات الواردة | Incoming call route
 // POST /api/incoming-call — يُرسله تطبيق Android عند رصد مكالمة واردة
-// POST /api/incoming-call — sent by Android app when an incoming call is detected
 
 import { Router, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
@@ -33,13 +32,16 @@ router.post("/incoming-call", requireAppSecret, async (req: Request, res: Respon
 
   const normalized = normalizePhone(callerPhone);
 
-  // ✅ FIFO Queue: أقدم جلسة نشطة أولاً | Oldest active session first
+  // كل جلسة مستقلة — المكالمة تتطابق مع أي جلسة نشطة للرقم دون ترتيب مُفضَّل
+  // Each session is independent — the call matches any active session for this number
+  // لو في أكثر من جلسة للرقم الواحد (نادر)، يُختار أي واحدة ومنع التكرار بـ WHERE verified=FALSE
+  // If multiple sessions exist for the same number (rare), any is picked — double-processing
+  // prevented by WHERE verified=FALSE
   const session = await pool.query(
     `SELECT id, phone FROM verification_sessions
      WHERE phone = $1
        AND verified = FALSE
        AND expires_at > NOW()
-     ORDER BY created_at ASC
      LIMIT 1`,
     [normalized]
   );
@@ -50,14 +52,12 @@ router.post("/incoming-call", requireAppSecret, async (req: Request, res: Respon
   if ((session.rowCount ?? 0) > 0) {
     sessionId = session.rows[0].id as string;
 
-    // ✅ تحديث DB فوراً
     await pool.query(
       "UPDATE verification_sessions SET verified = TRUE WHERE id = $1",
       [sessionId]
     );
 
     // ⚡ إشعار فوري — يوقظ الـ Long-Poll في أقل من 1ms
-    // ⚡ Instant signal — wakes up the Long-Poll in <1ms
     notifySession(sessionId);
 
     matched = true;
@@ -71,8 +71,9 @@ router.post("/incoming-call", requireAppSecret, async (req: Request, res: Respon
   res.json({ matched, phone: normalized });
 });
 
+// إصلاح: \d بدل d لضمان حذف جميع الرموز | Fix: \d not d to strip all non-digit chars
 function normalizePhone(phone: string): string {
-  return phone.replace(/[^d+]/g, "");
+  return phone.replace(/[^\d+]/g, "");
 }
 
 export default router;
