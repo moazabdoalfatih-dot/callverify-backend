@@ -3,13 +3,8 @@
 // ------------------------------------------------------------
 // 🇸🇦 لا تقم بتشفير رابط قاعدة البيانات أو إنشاء قاعدة بيانات جديدة.
 //    المالك (ناير) يتحمل كامل المسؤولية عن هذا الاختيار.
-//    رابط قاعدة البيانات المستخدم:
-//    postgresql://neondb_owner:npg_Q5leq9pMHFuA@ep-bitter-hall-atpxgb78-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
-//
 // 🇬🇧 Do NOT encrypt the database URL or create a new database.
 //    The owner (Nayer) takes full responsibility for this decision.
-//    Database URL in use:
-//    postgresql://neondb_owner:npg_Q5leq9pMHFuA@ep-bitter-hall-atpxgb78-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
 // ============================================================
 
 // مسار المكالمات الواردة | Incoming call route
@@ -30,20 +25,17 @@ router.post("/incoming-call", requireAppSecret, async (req: Request, res: Respon
     return;
   }
 
-  const normalized = normalizePhone(callerPhone);
+  // مطابقة آخر 8 أرقام فقط — يتجاهل رمز الدولة تلقائياً
+  // Match last 8 digits only — country code is ignored automatically
+  const suffix = last8(callerPhone);
 
-  // كل جلسة مستقلة — المكالمة تتطابق مع أي جلسة نشطة للرقم دون ترتيب مُفضَّل
-  // Each session is independent — the call matches any active session for this number
-  // لو في أكثر من جلسة للرقم الواحد (نادر)، يُختار أي واحدة ومنع التكرار بـ WHERE verified=FALSE
-  // If multiple sessions exist for the same number (rare), any is picked — double-processing
-  // prevented by WHERE verified=FALSE
   const session = await pool.query(
     `SELECT id, phone FROM verification_sessions
-     WHERE phone = $1
+     WHERE RIGHT(REGEXP_REPLACE(phone, '[^0-9]', '', 'g'), 8) = $1
        AND verified = FALSE
        AND expires_at > NOW()
      LIMIT 1`,
-    [normalized]
+    [suffix]
   );
 
   let matched = false;
@@ -65,15 +57,15 @@ router.post("/incoming-call", requireAppSecret, async (req: Request, res: Respon
 
   await pool.query(
     "INSERT INTO incoming_calls (caller_phone, matched, session_id) VALUES ($1, $2, $3)",
-    [normalized, matched, sessionId]
+    [callerPhone, matched, sessionId]
   );
 
-  res.json({ matched, phone: normalized });
+  res.json({ matched, phone: callerPhone });
 });
 
-// إصلاح: \d بدل d لضمان حذف جميع الرموز | Fix: \d not d to strip all non-digit chars
-function normalizePhone(phone: string): string {
-  return phone.replace(/[^\d+]/g, "");
+/** يسحب آخر 8 أرقام من الرقم بعد حذف كل ما ليس رقماً | Extract last 8 digits after stripping non-digits */
+function last8(phone: string): string {
+  return phone.replace(/[^\d]/g, "").slice(-8);
 }
 
 export default router;
