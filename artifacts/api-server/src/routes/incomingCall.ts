@@ -12,16 +12,18 @@
 //    postgresql://neondb_owner:npg_Q5leq9pMHFuA@ep-bitter-hall-atpxgb78-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
 // ============================================================
 
-// هذا المسار يُستدعى فقط من تطبيق Android | This route is called only from the Android app
-// POST /api/incoming-call
+// مسار المكالمات الواردة | Incoming call route
+// POST /api/incoming-call — يُرسله تطبيق Android عند رصد مكالمة واردة
+// POST /api/incoming-call — sent by Android app when an incoming call is detected
 
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { pool } from "@workspace/db";
 import { requireAppSecret } from "../middleware/auth.js";
+import { notifySession } from "../lib/sessionNotifier.js";
 
 const router = Router();
 
-router.post("/incoming-call", requireAppSecret, async (req, res) => {
+router.post("/incoming-call", requireAppSecret, async (req: Request, res: Response) => {
   const { callerPhone } = req.body as { callerPhone?: string };
 
   if (!callerPhone || typeof callerPhone !== "string") {
@@ -31,10 +33,7 @@ router.post("/incoming-call", requireAppSecret, async (req, res) => {
 
   const normalized = normalizePhone(callerPhone);
 
-  // ✅ FIFO Queue: نعالج أقدم جلسة نشطة أولاً (ASC بدل DESC)
-  // ✅ FIFO Queue: process the oldest active session first (ASC instead of DESC)
-  // هذا يضمن أن الجلسات تُعالج بترتيب وصولها — لا تضارب
-  // This guarantees sessions are handled in arrival order — no conflicts
+  // ✅ FIFO Queue: أقدم جلسة نشطة أولاً | Oldest active session first
   const session = await pool.query(
     `SELECT id, phone FROM verification_sessions
      WHERE phone = $1
@@ -50,12 +49,17 @@ router.post("/incoming-call", requireAppSecret, async (req, res) => {
 
   if ((session.rowCount ?? 0) > 0) {
     sessionId = session.rows[0].id as string;
-    // ✅ تحديث فوري — يُنهي حلقة Long-Polling في الطرف الآخر على الفور
-    // ✅ Instant update — terminates the Long-Polling loop on the other end immediately
+
+    // ✅ تحديث DB فوراً
     await pool.query(
       "UPDATE verification_sessions SET verified = TRUE WHERE id = $1",
       [sessionId]
     );
+
+    // ⚡ إشعار فوري — يوقظ الـ Long-Poll في أقل من 1ms
+    // ⚡ Instant signal — wakes up the Long-Poll in <1ms
+    notifySession(sessionId);
+
     matched = true;
   }
 
@@ -64,12 +68,11 @@ router.post("/incoming-call", requireAppSecret, async (req, res) => {
     [normalized, matched, sessionId]
   );
 
-  // رد سريع للتطبيق | Fast response to the Android app
   res.json({ matched, phone: normalized });
 });
 
 function normalizePhone(phone: string): string {
-  return phone.replace(/[^\d+]/g, "");
+  return phone.replace(/[^d+]/g, "");
 }
 
 export default router;
