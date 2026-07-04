@@ -1,0 +1,177 @@
+{
+  "config_version": 5,
+  "package_name": "com.company.callverify",
+  "app_name": "CallVerify",
+
+  "general": {
+    "name": "CallVerify",
+    "initialURL": "https://YOUR_DEPLOYED_URL_HERE",
+    "packageName": "com.company.callverify",
+    "targetDevice": "phone",
+    "minAndroidVersion": 8,
+    "pullToRefresh": {
+      "enabled": true,
+      "color": "#1a1a2e"
+    },
+    "swipeToNavigate": false,
+    "allowZoom": false
+  },
+
+  "webview": {
+    "userAgent": "CallVerify-Android/1.0",
+    "allowFileUploads": true,
+    "fileUploadAcceptTypes": "image/*, video/*, .pdf, .doc, .docx",
+    "enableCamera": true,
+    "enableMicrophone": true,
+    "geolocationEnabled": false,
+    "supportMultipleWindows": false,
+    "openLinkInExternalBrowser": {
+      "enabled": true,
+      "regex": "^(?!https:\\/\\/YOUR_DEPLOYED_URL_HERE).*"
+    },
+    "interceptHtml": false
+  },
+
+  "styling": {
+    "statusBarColor": "#1a1a2e",
+    "statusBarStyle": "light",
+    "navigationBarColor": "#1a1a2e",
+    "splashScreen": {
+      "enabled": true,
+      "backgroundColor": "#1a1a2e",
+      "image": "splash.png",
+      "imageScale": "fit",
+      "showSpinner": true,
+      "spinnerColor": "#ffffff"
+    },
+    "icon": {
+      "regular": "icon.png",
+      "roundedCorners": true
+    }
+  },
+
+  "offline": {
+    "enabled": true,
+    "message": "لا يوجد اتصال بالإنترنت. يرجى التحقق من اتصالك والمحاولة مجدداً.",
+    "image": "offline.png",
+    "reloadButtonText": "إعادة المحاولة",
+    "backgroundColor": "#1a1a2e",
+    "textColor": "#ffffff"
+  },
+
+  "permissions": {
+    "camera": {
+      "enabled": true,
+      "rationale": "التطبيق يحتاج الكاميرا لرفع الصور"
+    },
+    "readExternalStorage": {
+      "enabled": true,
+      "rationale": "التطبيق يحتاج الوصول للملفات لرفعها"
+    },
+    "writeExternalStorage": {
+      "enabled": true
+    },
+    "internet": {
+      "enabled": true
+    },
+    "readPhoneState": {
+      "enabled": true,
+      "rationale": "التطبيق يحتاج للوصول لمعلومات الهاتف للتحقق من المكالمات"
+    },
+    "readCallLog": {
+      "enabled": true,
+      "rationale": "التطبيق يحتاج سجل المكالمات للتحقق من هوية المتصل"
+    },
+    "receiveBootCompleted": {
+      "enabled": true
+    },
+    "foregroundService": {
+      "enabled": true
+    },
+    "postNotifications": {
+      "enabled": true,
+      "rationale": "التطبيق يحتاج إذن الإشعارات لإرسال تنبيهات المكالمات"
+    },
+    "vibrate": {
+      "enabled": true
+    },
+    "wakeLock": {
+      "enabled": true
+    }
+  },
+
+  "push": {
+    "enabled": true,
+    "provider": "fcm",
+    "notificationChannels": [
+      {
+        "id": "callverify_calls",
+        "name": "مكالمات التحقق",
+        "description": "إشعارات مكالمات التحقق من الهوية",
+        "importance": "high",
+        "sound": true,
+        "vibration": true
+      },
+      {
+        "id": "callverify_general",
+        "name": "إشعارات عامة",
+        "description": "إشعارات عامة من التطبيق",
+        "importance": "default"
+      }
+    ],
+    "registration": {
+      "enabled": true,
+      "url": "https://YOUR_DEPLOYED_URL_HERE/api/push/register",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "sendDeviceInfo": true
+    }
+  },
+
+  "nativePlugins": {
+    "phoneCallListener": {
+      "enabled": false,
+      "note": "سيتم تفعيله لاحقاً — يستمع للمكالمات الواردة ويرسلها للـ API",
+      "config": {
+        "apiEndpoint": "https://YOUR_DEPLOYED_URL_HERE/api/incoming-call",
+        "appSecretHeader": "X-App-Secret",
+        "appSecretValue": "YOUR_APP_SECRET_HERE"
+      }
+    },
+    "backgroundService": {
+      "enabled": false,
+      "note": "سيتم تفعيله لاحقاً — يبقي التطبيق يعمل في الخلفية"
+    }
+  },
+
+  "javascript": {
+    "calls": [
+      {
+        "url": ".*",
+        "filename": "median-bridge.js",
+        "inject": "everytime"
+      }
+    ]
+  },
+
+  "registration": {
+    "registrationEndpoint": "https://YOUR_DEPLOYED_URL_HERE/api/push/register"
+  },
+
+  "urlSchemes": [
+    {
+      "scheme": "callverify",
+      "description": "Deep link scheme للتطبيق"
+    }
+  ],
+
+  "build": {
+    "minSdkVersion": 26,
+    "targetSdkVersion": 34,
+    "compileSdkVersion": 34,
+    "versionCode": 1,
+    "versionName": "1.0.0"
+  }
+}

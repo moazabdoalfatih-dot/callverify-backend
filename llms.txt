@@ -1,0 +1,399 @@
+# CallVerify — AI Developer Context
+
+This file describes the CallVerify system for AI assistants (Claude, Copilot, Cursor, GPT, etc.)
+so they can understand, integrate, and extend the system without reading all source files.
+
+---
+
+## What is CallVerify?
+
+CallVerify is a **phone-call-based identity verification system**.
+It proves a user owns a phone number by asking them to make a real phone call.
+
+No SMS. No OTP codes. A real phone call — impossible to fake without physical access to the device.
+
+---
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CallVerify System                        │
+├──────────────┬──────────────────────┬───────────────────────┤
+│ Android App  │    API Server        │   Admin Dashboard     │
+│ (Kotlin)     │    (Express/Node)    │   (React + Vite)      │
+│              │                      │                       │
+│ Runs in BG   │  POST /incoming-call │  Manage API clients   │
+│ Reads Caller │  POST /sessions      │  View calls/sessions  │
+│ ID           │  GET  /sessions/:id  │  Configure settings   │
+│ POSTs to API │  GET  /admin/*       │                       │
+└──────────────┴──────────────────────┴───────────────────────┘
+         │                │
+         └────────────────┘
+              PostgreSQL (Neon)
+         Tables: api_clients, verification_sessions,
+                 incoming_calls, system_settings
+```
+
+---
+
+## Verification Flow (Step by Step)
+
+```
+1. Your website calls:
+   POST /api/sessions
+   Authorization: Bearer YOUR_API_KEY
+   { "phone": "+249912345678" }
+
+   Response: {
+     "sessionId": "uuid-here",
+     "callNumber": "+249000000000",   ← the number the user must call
+     "expiresIn": 300                 ← seconds until session expires
+   }
+
+2. Show the user: "Please call +249000000000 from your phone"
+
+3. User dials +249000000000 on their physical phone
+
+4. Android app on the receiving device detects the call:
+   POST /api/incoming-call
+   X-App-Secret: APP_SECRET_HERE
+   { "callerPhone": "+249912345678" }
+
+   System matches callerPhone → session → marks verified: true
+
+5. Your website polls:
+   GET /api/sessions/uuid-here
+   Authorization: Bearer YOUR_API_KEY
+
+   Response when verified: {
+     "verified": true,
+     "expired": false,
+     "phone": "+249912345678",
+     "remainingSeconds": 180
+   }
+
+6. User is verified ✅
+```
+
+---
+
+## Authentication Types
+
+| Header | Value | Used by |
+|--------|-------|---------|
+| `Authorization` | `Bearer cvk_abc123...` | Your website/app |
+| `X-App-Secret` | `<secret>` | Android app only |
+| `X-Admin-Password` | `admin123` (default) | Admin dashboard only |
+
+**To get an API key:**
+```
+POST /api/admin/clients
+X-Admin-Password: admin123
+Content-Type: application/json
+{ "name": "My Production Site" }
+
+Response: { "id": 1, "name": "...", "apiKey": "cvk_..." }
+```
+⚠️ Save the apiKey immediately — it is never shown again.
+
+---
+
+## Complete API Reference
+
+### Base URL
+```
+https://YOUR_DOMAIN/api
+```
+
+### Endpoints
+
+#### POST /sessions — Create verification session
+```
+Headers:
+  Authorization: Bearer YOUR_API_KEY
+  Content-Type: application/json
+
+Body:
+  { "phone": "+249912345678" }
+
+Response 200:
+  {
+    "sessionId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "callNumber": "+249000000000",
+    "expiresIn": 300
+  }
+
+Errors:
+  400 — phone is required
+  401 — invalid API key
+  429 — rate limit exceeded (10 req/min per client)
+```
+
+#### GET /sessions/{sessionId} — Poll verification status
+```
+Headers:
+  Authorization: Bearer YOUR_API_KEY
+
+Response 200:
+  {
+    "verified": true/false,
+    "expired": true/false,
+    "phone": "+249912345678",
+    "remainingSeconds": 240
+  }
+
+Errors:
+  404 — session not found
+```
+
+#### POST /incoming-call — Report call from Android app
+```
+Headers:
+  X-App-Secret: YOUR_APP_SECRET
+  Content-Type: application/json
+
+Body:
+  { "callerPhone": "+249912345678" }
+
+Response 200:
+  {
+    "matched": true/false,
+    "phone": "+249912345678"
+  }
+```
+
+#### GET /admin/clients — List API clients
+```
+Headers:
+  X-Admin-Password: admin123
+
+Response 200:
+  [{ "id": 1, "name": "...", "isActive": true, "createdAt": "..." }]
+```
+
+#### POST /admin/clients — Create API client
+```
+Headers:
+  X-Admin-Password: admin123
+  Content-Type: application/json
+
+Body:
+  { "name": "My App" }
+
+Response 200:
+  { "id": 1, "name": "My App", "apiKey": "cvk_..." }
+```
+
+#### PATCH /admin/clients/{id}/disable — Disable a client
+```
+Headers:
+  X-Admin-Password: admin123
+
+Response 200:
+  { "success": true }
+```
+
+#### GET /admin/calls — View incoming call logs
+```
+Headers:
+  X-Admin-Password: admin123
+
+Response 200:
+  [{
+    "id": 101,
+    "callerPhone": "+249912345678",
+    "matched": true,
+    "sessionId": "uuid-or-null",
+    "receivedAt": "2026-07-03T09:15:00.000Z"
+  }]
+```
+
+#### GET /admin/sessions — View verification session logs
+```
+Headers:
+  X-Admin-Password: admin123
+
+Response 200:
+  [{
+    "id": "uuid",
+    "phone": "+249912345678",
+    "clientId": 1,
+    "verified": true,
+    "expiresAt": "...",
+    "createdAt": "..."
+  }]
+```
+
+#### GET /admin/settings — Get system settings
+```
+Headers:
+  X-Admin-Password: admin123
+
+Response 200:
+  { "receivingPhoneNumber": "+249000000000" }
+```
+
+#### PUT /admin/settings — Update system settings
+```
+Headers:
+  X-Admin-Password: admin123
+  Content-Type: application/json
+
+Body:
+  { "receivingPhoneNumber": "+249111222333" }
+
+Response 200:
+  { "receivingPhoneNumber": "+249111222333" }
+```
+
+#### GET /healthz — Health check
+```
+Response 200:
+  { "status": "ok" }
+```
+
+---
+
+## Database Schema
+
+```sql
+-- API clients (websites/apps using CallVerify)
+CREATE TABLE api_clients (
+  id         SERIAL PRIMARY KEY,
+  name       TEXT NOT NULL,
+  api_key    TEXT NOT NULL UNIQUE,  -- hashed, bearer token
+  app_secret TEXT,                  -- for Android app
+  is_active  BOOLEAN DEFAULT true,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Verification sessions
+CREATE TABLE verification_sessions (
+  id         TEXT PRIMARY KEY,      -- UUID
+  phone      TEXT NOT NULL,         -- phone to verify
+  client_id  INTEGER REFERENCES api_clients(id),
+  verified   BOOLEAN DEFAULT false,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Log of all incoming calls received by Android app
+CREATE TABLE incoming_calls (
+  id           SERIAL PRIMARY KEY,
+  caller_phone TEXT NOT NULL,
+  matched      BOOLEAN DEFAULT false,
+  session_id   TEXT,
+  received_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- System configuration
+CREATE TABLE system_settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+-- Row: key='receiving_phone_number', value='+249000000000'
+```
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | Express.js + TypeScript + Node.js |
+| Database | PostgreSQL via Neon (serverless) |
+| Frontend | React + Vite + TypeScript + Tailwind CSS |
+| UI Components | shadcn/ui |
+| API Client | Orval (auto-generated from OpenAPI) + React Query |
+| Android | Kotlin (reads Caller ID, posts to API) |
+| Package Manager | pnpm (monorepo) |
+| Routing (admin) | Wouter |
+
+---
+
+## Project Structure
+
+```
+/
+├── artifacts/
+│   ├── api-server/          ← Express API server
+│   │   └── src/
+│   │       ├── app.ts       ← Express setup, CORS, middleware
+│   │       ├── routes/
+│   │       │   ├── admin.ts         ← /api/admin/* routes
+│   │       │   ├── sessions.ts      ← /api/sessions routes
+│   │       │   ├── incomingCall.ts  ← /api/incoming-call route
+│   │       │   └── health.ts        ← /api/healthz
+│   │       └── middleware/
+│   │           └── auth.ts  ← requireApiKey, requireAdmin, requireAppSecret
+│   └── admin-panel/         ← React admin dashboard
+│       └── src/
+│           ├── App.tsx      ← Routes + global fetch interceptor
+│           ├── pages/
+│           │   ├── Dashboard.tsx      ← Stats overview
+│           │   ├── ClientsManager.tsx ← Create/disable API clients
+│           │   ├── CallsLog.tsx       ← Incoming calls log
+│           │   ├── SessionsLog.tsx    ← Verification sessions log
+│           │   └── Settings.tsx       ← receivingPhoneNumber config
+│           └── components/layout/
+│               ├── Shell.tsx   ← Mobile drawer + desktop layout
+│               └── Sidebar.tsx ← Navigation sidebar (Arabic RTL)
+├── lib/
+│   ├── api-spec/
+│   │   └── openapi.yaml     ← Full OpenAPI 3.1 spec (source of truth)
+│   ├── api-client-react/    ← Auto-generated React Query hooks (from OpenAPI)
+│   └── db/
+│       └── src/index.ts     ← PostgreSQL pool (Neon)
+└── android-app/             ← Kotlin Android app source
+```
+
+---
+
+## Key Behaviors & Rules
+
+1. **Session matching**: When an incoming call arrives, the system finds sessions where
+   `phone = callerPhone` AND `verified = false` AND `expires_at > now()`, newest first.
+
+2. **Rate limiting**: In-memory Map, 10 sessions per client per 60 seconds.
+   No `express-rate-limit` package — custom implementation.
+
+3. **API key format**: Keys start with `cvk_` prefix and are stored as bcrypt hash in DB.
+   The raw key is only returned once at client creation time.
+
+4. **Admin auth**: `X-Admin-Password` header checked against env var `ADMIN_PASSWORD`
+   (default `admin123`). The fetch interceptor in `App.tsx` adds this header automatically
+   for all `/api/admin/` requests.
+
+5. **RTL/Arabic**: The admin panel is fully Arabic right-to-left.
+   `index.html` has `lang="ar" dir="rtl"`. Font: Cairo (Google Fonts).
+
+6. **receivingPhoneNumber**: Stored in `system_settings` table, read live on every
+   `POST /sessions` call. Change it via `PUT /api/admin/settings` or the Settings page.
+
+7. **Session expiry**: Sessions expire after 5 minutes (300 seconds).
+   A cleanup interval in `app.ts` deletes expired sessions periodically.
+
+---
+
+## Quick Integration Checklist
+
+- [ ] Create API client → get `apiKey`
+- [ ] Set `receivingPhoneNumber` in settings (the Android device's number)
+- [ ] Install Android app on receiving device, configure `X-App-Secret`
+- [ ] Call `POST /api/sessions` with user's phone → get `sessionId` + `callNumber`
+- [ ] Show `callNumber` to user, ask them to call it
+- [ ] Poll `GET /api/sessions/{sessionId}` every 2 seconds
+- [ ] Act on `verified: true` ✅
+
+---
+
+## OpenAPI Spec Location
+
+Full machine-readable spec (for code generation, Postman import, etc.):
+```
+lib/api-spec/openapi.yaml
+```
+
+Import into Postman: File → Import → select `openapi.yaml`
+Generate client SDK: `npx orval` (configured in `lib/api-client-react/`)

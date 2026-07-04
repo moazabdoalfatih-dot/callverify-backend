@@ -1,0 +1,890 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: |
+    # CallVerify API
+
+    ## نظرة عامة على النظام | System Overview
+
+    CallVerify هو نظام تحقق من هوية المستخدمين عبر المكالمات الهاتفية.
+    يعمل النظام على ثلاثة مكوّنات رئيسية:
+
+    1. **تطبيق Android** — يعمل في الخلفية، يرصد المكالمات الواردة ويرسلها للـ API
+    2. **API Server (هذا الملف)** — يربط المكالمات بجلسات التحقق
+    3. **Admin Dashboard** — لوحة تحكم لإدارة العملاء والجلسات
+
+    ---
+
+    ## كيف يعمل التحقق؟ | Verification Flow
+
+    ```
+    [موقعك / Your Website]
+          │
+          │ 1. POST /api/sessions  (مع API Key)
+          │    { phone: "+249XXXXXXXXX" }
+          │
+          ▼
+    [CallVerify API]
+          │
+          │ 2. يعيد: { sessionId, callNumber, expiresIn }
+          │    callNumber = رقم هاتف يجب أن يتصل به المستخدم
+          │
+          ▼
+    [المستخدم يتصل بـ callNumber من هاتفه]
+          │
+          ▼
+    [تطبيق Android على الجهاز المستقبِل]
+          │
+          │ 3. POST /api/incoming-call  (مع App Secret)
+          │    { callerPhone: "+249XXXXXXXXX" }
+          │
+          ▼
+    [CallVerify API يطابق المكالمة مع الجلسة]
+          │
+          │ 4. GET /api/sessions/{sessionId}
+          │    { verified: true, expired: false }
+          │
+          ▼
+    [موقعك يعرف أن المستخدم حقيقي ✓]
+    ```
+
+    ---
+
+    ## المصادقة | Authentication
+
+    هناك ثلاثة أنواع من المصادقة:
+
+    | النوع | الهيدر | من يستخدمه |
+    |-------|--------|------------|
+    | `ApiKey` | `Authorization: Bearer <key>` | موقعك / تطبيقك |
+    | `AppSecret` | `X-App-Secret: <secret>` | تطبيق Android فقط |
+    | `AdminPassword` | `X-Admin-Password: <pass>` | لوحة التحكم فقط |
+
+    للحصول على `ApiKey`: أنشئ عميلاً من لوحة التحكم أو `POST /api/admin/clients`
+
+    ---
+
+    ## مثال تكامل كامل | Full Integration Example
+
+    ```javascript
+    // 1. إنشاء جلسة تحقق
+    const session = await fetch('https://your-api/api/sessions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer YOUR_API_KEY'
+      },
+      body: JSON.stringify({ phone: '+249XXXXXXXXX' })
+    }).then(r => r.json());
+
+    // session = { sessionId: "abc123", callNumber: "+249000000000", expiresIn: 300 }
+
+    // 2. اعرض للمستخدم: "اتصل بالرقم +249000000000 من هاتفك"
+
+    // 3. استعلم عن حالة الجلسة كل ثانيتين
+    const interval = setInterval(async () => {
+      const status = await fetch(`https://your-api/api/sessions/${session.sessionId}`, {
+        headers: { 'Authorization': 'Bearer YOUR_API_KEY' }
+      }).then(r => r.json());
+
+      if (status.verified) {
+        clearInterval(interval);
+        console.log('✅ المستخدم تم التحقق منه!');
+      } else if (status.expired) {
+        clearInterval(interval);
+        console.log('❌ انتهت صلاحية الجلسة');
+      }
+    }, 2000);
+    ```
+
+servers:
+  - url: /api
+    description: Base API path
+
+tags:
+  - name: health
+    description: فحص صحة الخادم | Server health check
+  - name: calls
+    description: |
+      استقبال بيانات المكالمات الواردة من تطبيق Android.
+      هذه الـ endpoints تستخدمها **فقط** تطبيقات Android المخوّلة.
+  - name: sessions
+    description: |
+      إدارة جلسات التحقق.
+      هذه الـ endpoints يستخدمها **موقعك أو تطبيقك** للتحقق من هوية المستخدمين.
+  - name: admin
+    description: |
+      عمليات الإدارة — إدارة العملاء والإعدادات وعرض السجلات.
+      محمية بكلمة مرور المدير.
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: فحص صحة الخادم
+      description: |
+        يتحقق من أن الخادم يعمل بشكل طبيعي.
+        استخدمه في monitoring أو قبل إرسال أي طلبات.
+      responses:
+        "200":
+          description: الخادم يعمل بشكل طبيعي
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+              example:
+                status: "ok"
+
+  /incoming-call:
+    post:
+      operationId: reportIncomingCall
+      tags: [calls]
+      summary: إبلاغ عن مكالمة واردة (تطبيق Android فقط)
+      description: |
+        يُرسَل من تطبيق Android عند استقبال مكالمة هاتفية.
+
+        **كيف يعمل:**
+        1. يستقبل تطبيق Android مكالمة على الجهاز
+        2. يرسل رقم المتصل لهذا الـ endpoint
+        3. يبحث النظام عن جلسة تحقق مفتوحة تنتظر هذا الرقم
+        4. إذا وُجدت — يُعلّم الجلسة كـ `verified: true`
+
+        **ملاحظة:** يجب إرسال الرقم بصيغة دولية (`+249XXXXXXXXX`)
+
+        **المصادقة:** `X-App-Secret` — يُطلب من مطور Android فقط
+      security:
+        - AppSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IncomingCallInput"
+            example:
+              callerPhone: "+249912345678"
+      responses:
+        "200":
+          description: تمت معالجة المكالمة
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallResult"
+              examples:
+                matched:
+                  summary: المكالمة طابقت جلسة
+                  value:
+                    matched: true
+                    phone: "+249912345678"
+                not_matched:
+                  summary: لا توجد جلسة تنتظر هذا الرقم
+                  value:
+                    matched: false
+                    phone: "+249912345678"
+        "400":
+          description: بيانات غير صحيحة
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "callerPhone is required"
+        "403":
+          description: App Secret غير صحيح
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "Forbidden"
+
+  /sessions:
+    post:
+      operationId: createSession
+      tags: [sessions]
+      summary: إنشاء جلسة تحقق جديدة
+      description: |
+        أهم endpoint في النظام — ابدأ هنا لتحقق من هوية مستخدم.
+
+        **الخطوات:**
+        1. أرسل رقم هاتف المستخدم المراد التحقق منه
+        2. سيعيد النظام `callNumber` — الرقم الذي يجب أن يتصل به المستخدم
+        3. اعرض `callNumber` للمستخدم واطلب منه الاتصال به من هاتفه
+        4. استعلم عن `sessionId` حتى يصبح `verified: true`
+        5. الجلسة تنتهي تلقائياً بعد `expiresIn` ثانية (افتراضياً 5 دقائق)
+
+        **Rate Limit:** 10 جلسات لكل عميل كل دقيقة
+
+        **المصادقة:** `Authorization: Bearer YOUR_API_KEY`
+      security:
+        - ApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionInput"
+            example:
+              phone: "+249912345678"
+      responses:
+        "200":
+          description: تم إنشاء الجلسة بنجاح
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionCreated"
+              example:
+                sessionId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                callNumber: "+249000000000"
+                expiresIn: 300
+        "400":
+          description: بيانات غير صحيحة
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "phone is required"
+        "401":
+          description: API Key غير صحيح أو مفقود
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "Unauthorized"
+        "429":
+          description: تجاوزت الحد المسموح من الطلبات
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "Rate limit exceeded. Try again in 60 seconds."
+
+  /sessions/{sessionId}:
+    get:
+      operationId: getSession
+      tags: [sessions]
+      summary: الاستعلام عن حالة جلسة التحقق
+      description: |
+        استعلم عن هذا الـ endpoint بعد إنشاء الجلسة لمعرفة إذا اتصل المستخدم أم لا.
+
+        **منطق الاستعلام الموصى به:**
+        ```javascript
+        // استعلم كل ثانيتين حتى verified أو expired
+        const poll = setInterval(async () => {
+          const { verified, expired, remainingSeconds } = await getSession(sessionId);
+          if (verified) { /* ✅ نجح التحقق */ clearInterval(poll); }
+          if (expired)  { /* ❌ انتهت الجلسة */ clearInterval(poll); }
+        }, 2000);
+
+        // أوقف الاستعلام بعد انتهاء الوقت + ثانية احتياطية
+        setTimeout(() => clearInterval(poll), (expiresIn + 1) * 1000);
+        ```
+
+        **حقل `remainingSeconds`:** الثواني المتبقية قبل انتهاء الجلسة — استخدمه لعرض عداد للمستخدم
+      security:
+        - ApiKey: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: معرّف الجلسة المُعاد من `POST /sessions`
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      responses:
+        "200":
+          description: حالة الجلسة
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionStatus"
+              examples:
+                pending:
+                  summary: لم يتصل المستخدم بعد
+                  value:
+                    verified: false
+                    expired: false
+                    phone: "+249912345678"
+                    remainingSeconds: 240
+                verified:
+                  summary: تم التحقق بنجاح
+                  value:
+                    verified: true
+                    expired: false
+                    phone: "+249912345678"
+                    remainingSeconds: 180
+                expired:
+                  summary: انتهت صلاحية الجلسة
+                  value:
+                    verified: false
+                    expired: true
+                    phone: "+249912345678"
+                    remainingSeconds: 0
+        "404":
+          description: الجلسة غير موجودة أو انتهت وحُذفت
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "Session not found"
+
+  /admin/clients:
+    get:
+      operationId: listClients
+      tags: [admin]
+      summary: قائمة عملاء API المسجّلين
+      description: |
+        يعرض جميع العملاء (التطبيقات والمواقع) المسجّلة في النظام.
+        كل عميل لديه `apiKey` خاص يستخدمه للوصول لـ `/sessions`.
+
+        **المصادقة:** `X-Admin-Password: admin123` (افتراضي)
+      security:
+        - AdminPassword: []
+      responses:
+        "200":
+          description: قائمة العملاء
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ApiClient"
+              example:
+                - id: 1
+                  name: "الموقع الإنتاجي"
+                  isActive: true
+                  createdAt: "2026-01-15T10:30:00.000Z"
+                - id: 2
+                  name: "تطبيق الاختبار"
+                  isActive: false
+                  createdAt: "2026-01-10T08:00:00.000Z"
+        "403":
+          description: كلمة مرور المدير غير صحيحة
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "Forbidden"
+
+    post:
+      operationId: createClient
+      tags: [admin]
+      summary: إنشاء عميل API جديد
+      description: |
+        يُنشئ عميلاً جديداً ويُعيد `apiKey` خاصاً به.
+
+        ⚠️ **مهم:** احفظ `apiKey` فوراً — **لن يظهر مرة أخرى**.
+        إذا فقدته، يجب تعطيل العميل وإنشاء آخر جديد.
+
+        الـ `apiKey` هو ما يستخدمه موقعك في `Authorization: Bearer <apiKey>`
+      security:
+        - AdminPassword: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientInput"
+            example:
+              name: "موقعي الإنتاجي"
+      responses:
+        "200":
+          description: تم إنشاء العميل مع مفتاح API
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientCreated"
+              example:
+                id: 3
+                name: "موقعي الإنتاجي"
+                apiKey: "cvk_a1b2c3d4e5f6789012345678901234567890abcd"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /admin/clients/{id}/disable:
+    patch:
+      operationId: disableClient
+      tags: [admin]
+      summary: تعطيل عميل API
+      description: |
+        يُلغي صلاحية وصول عميل بشكل فوري ودائم.
+        بعد التعطيل، أي طلب يستخدم `apiKey` هذا العميل سيُرفض بـ 401.
+
+        ⚠️ لا يمكن التراجع عن هذه العملية — أنشئ عميلاً جديداً إذا احتجت.
+      security:
+        - AdminPassword: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: معرّف العميل (من قائمة العملاء)
+          example: 2
+      responses:
+        "200":
+          description: تم التعطيل بنجاح
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResult"
+              example:
+                success: true
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /admin/calls:
+    get:
+      operationId: listCalls
+      tags: [admin]
+      summary: سجل المكالمات الواردة
+      description: |
+        يعرض آخر المكالمات التي استقبلها النظام من تطبيق Android.
+
+        حقل `matched` يُشير إذا طابقت المكالمة جلسة تحقق مفتوحة.
+        حقل `sessionId` يُشير لجلسة التحقق التي طابقتها (أو null إذا لم تطابق).
+      security:
+        - AdminPassword: []
+      responses:
+        "200":
+          description: قائمة المكالمات
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CallRecord"
+              example:
+                - id: 101
+                  callerPhone: "+249912345678"
+                  matched: true
+                  sessionId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  receivedAt: "2026-07-03T09:15:00.000Z"
+                - id: 100
+                  callerPhone: "+249987654321"
+                  matched: false
+                  sessionId: null
+                  receivedAt: "2026-07-03T09:10:00.000Z"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /admin/sessions:
+    get:
+      operationId: listSessions
+      tags: [admin]
+      summary: سجل جلسات التحقق
+      description: |
+        يعرض آخر جلسات التحقق التي أنشأها النظام.
+
+        مفيد لمراقبة استخدام النظام وتشخيص مشاكل التحقق.
+        حقل `verified` يُشير إذا اكتمل التحقق بنجاح.
+      security:
+        - AdminPassword: []
+      responses:
+        "200":
+          description: قائمة الجلسات
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VerificationSession"
+              example:
+                - id: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  phone: "+249912345678"
+                  clientId: 1
+                  verified: true
+                  expiresAt: "2026-07-03T09:20:00.000Z"
+                  createdAt: "2026-07-03T09:15:00.000Z"
+                - id: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+                  phone: "+249987654321"
+                  clientId: 1
+                  verified: false
+                  expiresAt: "2026-07-03T09:05:00.000Z"
+                  createdAt: "2026-07-03T09:00:00.000Z"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /admin/settings:
+    get:
+      operationId: getSettings
+      tags: [admin]
+      summary: الاطلاع على إعدادات النظام
+      description: |
+        يُعيد إعدادات النظام الحالية.
+
+        `receivingPhoneNumber` هو رقم الهاتف الذي يجب أن يتصل به المستخدم للتحقق.
+        هذا الرقم هو رقم الجهاز الذي عليه تطبيق Android.
+      security:
+        - AdminPassword: []
+      responses:
+        "200":
+          description: الإعدادات الحالية
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemSettings"
+              example:
+                receivingPhoneNumber: "+249000000000"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+    put:
+      operationId: updateSettings
+      tags: [admin]
+      summary: تحديث إعدادات النظام
+      description: |
+        يُحدّث رقم الهاتف المستقبِل للمكالمات.
+
+        **متى تستخدم هذا؟**
+        إذا غيّرت الجهاز الذي يعمل عليه تطبيق Android، حدّث الرقم من هنا.
+        سيبدأ النظام فوراً بإرسال الرقم الجديد لأي جلسة تحقق تُنشأ بعد التحديث.
+      security:
+        - AdminPassword: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SystemSettingsInput"
+            example:
+              receivingPhoneNumber: "+249111222333"
+      responses:
+        "200":
+          description: تم التحديث بنجاح
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemSettings"
+              example:
+                receivingPhoneNumber: "+249111222333"
+        "400":
+          description: رقم الهاتف غير صحيح
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+              example:
+                error: "receivingPhoneNumber is required"
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+components:
+  securitySchemes:
+    AppSecret:
+      type: apiKey
+      in: header
+      name: X-App-Secret
+      description: |
+        سر خاص بتطبيق Android — يُستخدم فقط لإرسال بيانات المكالمات الواردة.
+        يُطلب من مطور Android فقط.
+    ApiKey:
+      type: http
+      scheme: bearer
+      description: |
+        مفتاح API الخاص بعميلك — احصل عليه من `POST /admin/clients`.
+        أضفه في هيدر: `Authorization: Bearer YOUR_API_KEY`
+    AdminPassword:
+      type: apiKey
+      in: header
+      name: X-Admin-Password
+      description: |
+        كلمة مرور لوحة التحكم — افتراضية `admin123`.
+        تُستخدم فقط من لوحة الـ Admin Dashboard.
+
+  schemas:
+    HealthStatus:
+      type: object
+      description: حالة الخادم
+      properties:
+        status:
+          type: string
+          description: دائماً "ok" إذا كان الخادم يعمل
+          example: "ok"
+      required:
+        - status
+
+    ApiError:
+      type: object
+      description: خطأ من الـ API
+      properties:
+        error:
+          type: string
+          description: رسالة الخطأ بالإنجليزية
+          example: "Unauthorized"
+      required:
+        - error
+
+    SuccessResult:
+      type: object
+      description: نتيجة عملية ناجحة
+      properties:
+        success:
+          type: boolean
+          description: دائماً true عند النجاح
+          example: true
+      required:
+        - success
+
+    IncomingCallInput:
+      type: object
+      description: بيانات المكالمة الواردة — مُرسَلة من تطبيق Android
+      properties:
+        callerPhone:
+          type: string
+          description: رقم المتصل بصيغة دولية
+          example: "+249912345678"
+      required:
+        - callerPhone
+
+    CallResult:
+      type: object
+      description: نتيجة معالجة المكالمة الواردة
+      properties:
+        matched:
+          type: boolean
+          description: |
+            `true` = طابقت المكالمة جلسة تحقق مفتوحة وتم التحقق بنجاح
+            `false` = لا توجد جلسة تنتظر هذا الرقم
+        phone:
+          type: string
+          description: رقم المتصل كما أُرسل
+          example: "+249912345678"
+      required:
+        - matched
+        - phone
+
+    SessionInput:
+      type: object
+      description: طلب إنشاء جلسة تحقق جديدة
+      properties:
+        phone:
+          type: string
+          description: رقم هاتف المستخدم المراد التحقق منه (بصيغة دولية)
+          example: "+249912345678"
+      required:
+        - phone
+
+    SessionCreated:
+      type: object
+      description: تفاصيل جلسة التحقق المُنشأة
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: معرّف الجلسة — احتفظ به للاستعلام عن حالتها
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        callNumber:
+          type: string
+          description: الرقم الذي يجب أن يتصل به المستخدم من هاتفه
+          example: "+249000000000"
+        expiresIn:
+          type: integer
+          description: مدة صلاحية الجلسة بالثواني (افتراضي 300 = 5 دقائق)
+          example: 300
+      required:
+        - sessionId
+        - callNumber
+        - expiresIn
+
+    SessionStatus:
+      type: object
+      description: الحالة الحالية لجلسة التحقق
+      properties:
+        verified:
+          type: boolean
+          description: "`true` = اتصل المستخدم وتم التحقق منه بنجاح ✅"
+        expired:
+          type: boolean
+          description: "`true` = انتهت صلاحية الجلسة دون تحقق ❌"
+        phone:
+          type: ["string", "null"]
+          description: رقم الهاتف المرتبط بالجلسة
+          example: "+249912345678"
+        remainingSeconds:
+          type: integer
+          description: الثواني المتبقية قبل انتهاء الجلسة — استخدمه لعرض عداد للمستخدم
+          example: 240
+      required:
+        - verified
+        - expired
+        - remainingSeconds
+
+    ApiClient:
+      type: object
+      description: عميل API مسجّل في النظام
+      properties:
+        id:
+          type: integer
+          description: معرّف العميل
+          example: 1
+        name:
+          type: string
+          description: اسم العميل / التطبيق
+          example: "الموقع الإنتاجي"
+        isActive:
+          type: boolean
+          description: "`true` = العميل يعمل، `false` = معطّل لا يستطيع الوصول"
+        createdAt:
+          type: string
+          format: date-time
+          description: تاريخ إنشاء العميل
+          example: "2026-01-15T10:30:00.000Z"
+      required:
+        - id
+        - name
+        - isActive
+        - createdAt
+
+    ClientInput:
+      type: object
+      description: بيانات إنشاء عميل جديد
+      properties:
+        name:
+          type: string
+          description: اسم واضح للعميل / التطبيق
+          example: "موقعي الإنتاجي"
+          minLength: 2
+          maxLength: 50
+      required:
+        - name
+
+    ClientCreated:
+      type: object
+      description: |
+        تفاصيل العميل المُنشأ مع مفتاح API.
+        ⚠️ احفظ `apiKey` الآن — لن يُعرض مرة أخرى.
+      properties:
+        id:
+          type: integer
+          example: 3
+        name:
+          type: string
+          example: "موقعي الإنتاجي"
+        apiKey:
+          type: string
+          description: مفتاح API — استخدمه في `Authorization: Bearer <apiKey>`
+          example: "cvk_a1b2c3d4e5f6789012345678901234567890abcd"
+      required:
+        - id
+        - name
+        - apiKey
+
+    CallRecord:
+      type: object
+      description: سجل مكالمة واردة
+      properties:
+        id:
+          type: integer
+          example: 101
+        callerPhone:
+          type: string
+          description: رقم المتصل
+          example: "+249912345678"
+        matched:
+          type: boolean
+          description: هل طابقت جلسة تحقق؟
+        sessionId:
+          type: ["string", "null"]
+          description: معرّف الجلسة التي طابقتها (null إذا لم تطابق)
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        receivedAt:
+          type: string
+          format: date-time
+          description: وقت استقبال المكالمة
+          example: "2026-07-03T09:15:00.000Z"
+      required:
+        - id
+        - callerPhone
+        - matched
+        - receivedAt
+
+    VerificationSession:
+      type: object
+      description: سجل جلسة تحقق
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: معرّف الجلسة
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        phone:
+          type: string
+          description: رقم هاتف المستخدم
+          example: "+249912345678"
+        clientId:
+          type: ["integer", "null"]
+          description: معرّف العميل الذي أنشأ الجلسة
+          example: 1
+        verified:
+          type: boolean
+          description: هل اكتمل التحقق؟
+        expiresAt:
+          type: string
+          format: date-time
+          description: وقت انتهاء صلاحية الجلسة
+          example: "2026-07-03T09:20:00.000Z"
+        createdAt:
+          type: string
+          format: date-time
+          description: وقت إنشاء الجلسة
+          example: "2026-07-03T09:15:00.000Z"
+      required:
+        - id
+        - phone
+        - verified
+        - expiresAt
+        - createdAt
+
+    SystemSettings:
+      type: object
+      description: إعدادات النظام الحالية
+      properties:
+        receivingPhoneNumber:
+          type: string
+          description: رقم الهاتف الذي يجب أن يتصل به المستخدم للتحقق
+          example: "+249000000000"
+      required:
+        - receivingPhoneNumber
+
+    SystemSettingsInput:
+      type: object
+      description: بيانات تحديث الإعدادات
+      properties:
+        receivingPhoneNumber:
+          type: string
+          description: الرقم الجديد للهاتف المستقبِل
+          example: "+249111222333"
+      required:
+        - receivingPhoneNumber

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>لا يوجد اتصال — CallVerify</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Cairo', 'Segoe UI', sans-serif;
+      background: #1a1a2e;
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 2rem;
+      text-align: center;
+    }
+
+    .icon {
+      width: 80px;
+      height: 80px;
+      margin-bottom: 2rem;
+      opacity: 0.8;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+    }
+
+    p {
+      font-size: 0.95rem;
+      color: rgba(255,255,255,0.7);
+      line-height: 1.6;
+      max-width: 300px;
+      margin-bottom: 2rem;
+    }
+
+    button {
+      background: #ffffff;
+      color: #1a1a2e;
+      border: none;
+      border-radius: 12px;
+      padding: 0.85rem 2.5rem;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      font-family: inherit;
+      transition: opacity 0.2s;
+    }
+
+    button:active { opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <svg class="icon" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="40" cy="40" r="38" stroke="white" stroke-width="2" stroke-opacity="0.3"/>
+    <path d="M20 40 Q40 20 60 40 Q40 60 20 40Z" stroke="white" stroke-width="2" fill="none" stroke-opacity="0.5"/>
+    <line x1="15" y1="15" x2="65" y2="65" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+  </svg>
+
+  <h1>لا يوجد اتصال بالإنترنت</h1>
+  <p>تحقق من اتصالك بالشبكة ثم اضغط إعادة المحاولة</p>
+
+  <button onclick="window.location.reload()">إعادة المحاولة</button>
+</body>
+</html>
