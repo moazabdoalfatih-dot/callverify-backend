@@ -14,16 +14,25 @@
 
 // مسارات جلسات التحقق | Verification session routes
 // POST /api/sessions   — فتح جلسة | Open a session
-// GET  /api/sessions/:sessionId — الاستعلام عن الحالة | Query status
+// GET  /api/sessions/:sessionId — الاستعلام عن الحالة (Long-Polling) | Query status (Long-Polling)
 
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { randomUUID } from "crypto";
 import { pool } from "@workspace/db";
 import { requireApiKey } from "../middleware/auth.js";
 
 const router = Router();
 
-// يُقرأ رقم الاستقبال من قاعدة البيانات | Receiving number read from DB
+// ─── الإعدادات | Settings ────────────────────────────────────────────────────
+const SESSION_DURATION_MS      = 15 * 60 * 1000; // 15 دقيقة | 15 minutes
+const SESSION_DURATION_SECONDS = 900;
+
+// Long-Polling: السيرفر يمسك الاتصال حتى 25 ثانية ثم يرد — يضمن رد فوري عند المطابقة
+// Long-Polling: server holds connection up to 25s — guarantees instant response on match
+const LONG_POLL_MAX_MS      = 25_000; // أقصى وقت انتظار | Max wait time
+const LONG_POLL_INTERVAL_MS = 300;   // فحص كل 300ms | Check every 300ms
+
+// ─── يقرأ رقم الاستقبال من قاعدة البيانات | Read receiving number from DB ────
 async function getReceivingPhoneNumber(): Promise<string> {
   const result = await pool.query(
     "SELECT value FROM system_settings WHERE key = 'receiving_phone_number'"
@@ -33,10 +42,10 @@ async function getReceivingPhoneNumber(): Promise<string> {
     ?? "+249000000000";
 }
 
-// Rate limiting بسيط بدون مكتبة خارجية | Simple in-memory rate limiting
+// ─── Rate limiting بسيط | Simple in-memory rate limiting ───────────────────
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
-function checkRateLimit(key: string, max = 3, windowMs = 60_000): boolean {
+function checkRateLimit(key: string, max = 5, windowMs = 15 * 60 * 1000): boolean {
   const now = Date.now();
   const entry = rateLimitMap.get(key);
   if (!entry || now > entry.resetAt) {
@@ -49,7 +58,9 @@ function checkRateLimit(key: string, max = 3, windowMs = 60_000): boolean {
 }
 
 // ===== المسار 1: فتح جلسة تحقق جديدة | Open a new verification session =====
-router.post("/sessions", requireApiKey, async (req, res) => {
+// ✅ الجلسات تُوضع في قائمة انتظار — لا إلغاء للجلسات السابقة
+// ✅ Sessions are queued — previous sessions are NOT cancelled
+router.post("/sessions", requireApiKey, async (req: Request, res: Response) => {
   const { phone } = req.body as { phone?: string };
   const clientId = (req as Request & { clientId: number }).clientId;
 
@@ -60,24 +71,19 @@ router.post("/sessions", requireApiKey, async (req, res) => {
 
   const normalized = phone.replace(/[^\d+]/g, "");
 
-  // Rate limit per phone number
+  // Rate limit: 5 جلسات كل 15 دقيقة لنفس الرقم | 5 sessions per 15 min per number
   if (!checkRateLimit(normalized)) {
-    res
-      .status(429)
-      .json({ error: "انتظر قبل طلب تحقق جديد | Wait before requesting a new verification" });
+    res.status(429).json({
+      error: "وصلت للحد الأقصى من الجلسات — انتظر حتى تنتهي الجلسات الحالية | Too many sessions — wait for current sessions to expire",
+    });
     return;
   }
 
   const sessionId = randomUUID();
-  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 دقائق | 5 minutes
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
 
-  // إلغاء أي جلسات سابقة لنفس الرقم | Cancel previous sessions for same number
-  await pool.query(
-    "UPDATE verification_sessions SET expires_at = NOW() WHERE phone = $1 AND verified = FALSE",
-    [normalized]
-  );
-
-  // إنشاء الجلسة الجديدة | Create new session
+  // ✅ إنشاء الجلسة بدون إلغاء السابقة — تُضاف لقائمة الانتظار
+  // ✅ Create session without cancelling previous — added to the queue
   await pool.query(
     "INSERT INTO verification_sessions (id, phone, client_id, expires_at) VALUES ($1, $2, $3, $4)",
     [sessionId, normalized, clientId, expiresAt]
@@ -88,41 +94,65 @@ router.post("/sessions", requireApiKey, async (req, res) => {
   res.json({
     sessionId,
     callNumber,
-    expiresIn: 300, // ثواني | seconds
+    expiresIn: SESSION_DURATION_SECONDS,
   });
 });
 
-// ===== المسار 2: الاستعلام عن حالة الجلسة | Query session status =====
-router.get("/sessions/:sessionId", requireApiKey, async (req, res) => {
+// ===== المسار 2: الاستعلام بـ Long-Polling | Query with Long-Polling =====
+// ✅ الاتصال يبقى مفتوحاً — يرد فوراً عند المطابقة أو انتهاء الجلسة
+// ✅ Connection stays open — responds instantly on match or expiry
+router.get("/sessions/:sessionId", requireApiKey, async (req: Request, res: Response) => {
   const { sessionId } = req.params;
+  const pollStart = Date.now();
 
-  const result = await pool.query(
-    "SELECT phone, verified, expires_at FROM verification_sessions WHERE id = $1",
-    [sessionId]
-  );
+  // منع الـ cache على هذا الـ endpoint | No cache for this endpoint
+  res.setHeader("Cache-Control", "no-cache, no-store");
+  res.setHeader("X-Accel-Buffering", "no"); // تعطيل buffering في nginx | Disable nginx buffering
 
-  if (result.rowCount === 0) {
-    res.status(404).json({ error: "جلسة غير موجودة | Session not found" });
-    return;
+  // تنظيف عند قطع الاتصال من الجهة الأخرى | Cleanup on client disconnect
+  let clientGone = false;
+  req.on("close", () => { clientGone = true; });
+
+  // ─── حلقة Long-Polling ──────────────────────────────────────────────────
+  while (!clientGone) {
+    const result = await pool.query(
+      "SELECT phone, verified, expires_at FROM verification_sessions WHERE id = $1",
+      [sessionId]
+    );
+
+    if ((result.rowCount ?? 0) === 0) {
+      res.status(404).json({ error: "جلسة غير موجودة | Session not found" });
+      return;
+    }
+
+    const session = result.rows[0] as {
+      phone: string;
+      verified: boolean;
+      expires_at: Date;
+    };
+
+    const now = Date.now();
+    const expired = new Date(session.expires_at).getTime() < now;
+    const remainingSeconds = Math.max(
+      0,
+      Math.floor((new Date(session.expires_at).getTime() - now) / 1000)
+    );
+
+    // ✅ رد فوري: إذا تحققت الجلسة أو انتهت أو انتهى وقت Long-Poll
+    // ✅ Respond immediately: verified, expired, or long-poll timeout reached
+    if (session.verified || expired || now - pollStart >= LONG_POLL_MAX_MS) {
+      res.json({
+        verified: session.verified,
+        expired: expired && !session.verified,
+        phone: session.verified ? session.phone : null,
+        remainingSeconds,
+      });
+      return;
+    }
+
+    // انتظر قبل الفحص التالي | Wait before next check
+    await new Promise<void>((resolve) => setTimeout(resolve, LONG_POLL_INTERVAL_MS));
   }
-
-  const session = result.rows[0] as {
-    phone: string;
-    verified: boolean;
-    expires_at: Date;
-  };
-  const expired = new Date(session.expires_at) < new Date();
-  const remainingSeconds = Math.max(
-    0,
-    Math.floor((new Date(session.expires_at).getTime() - Date.now()) / 1000)
-  );
-
-  res.json({
-    verified: session.verified,
-    expired: expired && !session.verified,
-    phone: session.verified ? session.phone : null,
-    remainingSeconds,
-  });
 });
 
 export default router;
