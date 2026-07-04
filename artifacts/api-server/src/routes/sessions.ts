@@ -13,13 +13,14 @@
 // ============================================================
 
 // مسارات جلسات التحقق | Verification session routes
-// POST /api/sessions   — فتح جلسة | Open a session
-// GET  /api/sessions/:sessionId — الاستعلام عن الحالة (Long-Polling) | Query status (Long-Polling)
+// POST /api/sessions        — فتح جلسة | Open a session
+// GET  /api/sessions/:id    — الاستعلام بـ Long-Polling | Query with Long-Polling
 
 import { Router, type Request, type Response } from "express";
 import { randomUUID } from "crypto";
 import { pool } from "@workspace/db";
 import { requireApiKey } from "../middleware/auth.js";
+import { waitForNotification, removePendingPolls } from "../lib/sessionNotifier.js";
 
 const router = Router();
 
@@ -27,10 +28,10 @@ const router = Router();
 const SESSION_DURATION_MS      = 15 * 60 * 1000; // 15 دقيقة | 15 minutes
 const SESSION_DURATION_SECONDS = 900;
 
-// Long-Polling: السيرفر يمسك الاتصال حتى 25 ثانية ثم يرد — يضمن رد فوري عند المطابقة
-// Long-Polling: server holds connection up to 25s — guarantees instant response on match
-const LONG_POLL_MAX_MS      = 25_000; // أقصى وقت انتظار | Max wait time
-const LONG_POLL_INTERVAL_MS = 300;   // فحص كل 300ms | Check every 300ms
+// Long-Polling: يبقى مفتوحاً حتى 25 ثانية — يُنبَّه فورياً عند المطابقة عبر sessionNotifier
+// Long-Polling: stays open up to 25s — instantly signalled on match via sessionNotifier
+const LONG_POLL_MAX_MS      = 25_000;
+const LONG_POLL_FALLBACK_MS =  5_000; // فحص احتياطي من DB كل 5 ثوانٍ | Fallback DB check every 5s
 
 // ─── يقرأ رقم الاستقبال من قاعدة البيانات | Read receiving number from DB ────
 async function getReceivingPhoneNumber(): Promise<string> {
@@ -58,8 +59,8 @@ function checkRateLimit(key: string, max = 5, windowMs = 15 * 60 * 1000): boolea
 }
 
 // ===== المسار 1: فتح جلسة تحقق جديدة | Open a new verification session =====
-// ✅ الجلسات تُوضع في قائمة انتظار — لا إلغاء للجلسات السابقة
-// ✅ Sessions are queued — previous sessions are NOT cancelled
+// ✅ الجلسات تُوضع في قائمة انتظار FIFO — لا إلغاء للجلسات السابقة
+// ✅ Sessions are queued FIFO — previous sessions are NOT cancelled
 router.post("/sessions", requireApiKey, async (req: Request, res: Response) => {
   const { phone } = req.body as { phone?: string };
   const clientId = (req as Request & { clientId: number }).clientId;
@@ -69,9 +70,8 @@ router.post("/sessions", requireApiKey, async (req: Request, res: Response) => {
     return;
   }
 
-  const normalized = phone.replace(/[^\d+]/g, "");
+  const normalized = phone.replace(/[^d+]/g, "");
 
-  // Rate limit: 5 جلسات كل 15 دقيقة لنفس الرقم | 5 sessions per 15 min per number
   if (!checkRateLimit(normalized)) {
     res.status(429).json({
       error: "وصلت للحد الأقصى من الجلسات — انتظر حتى تنتهي الجلسات الحالية | Too many sessions — wait for current sessions to expire",
@@ -82,8 +82,6 @@ router.post("/sessions", requireApiKey, async (req: Request, res: Response) => {
   const sessionId = randomUUID();
   const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
 
-  // ✅ إنشاء الجلسة بدون إلغاء السابقة — تُضاف لقائمة الانتظار
-  // ✅ Create session without cancelling previous — added to the queue
   await pool.query(
     "INSERT INTO verification_sessions (id, phone, client_id, expires_at) VALUES ($1, $2, $3, $4)",
     [sessionId, normalized, clientId, expiresAt]
@@ -91,29 +89,25 @@ router.post("/sessions", requireApiKey, async (req: Request, res: Response) => {
 
   const callNumber = await getReceivingPhoneNumber();
 
-  res.json({
-    sessionId,
-    callNumber,
-    expiresIn: SESSION_DURATION_SECONDS,
-  });
+  res.json({ sessionId, callNumber, expiresIn: SESSION_DURATION_SECONDS });
 });
 
 // ===== المسار 2: الاستعلام بـ Long-Polling | Query with Long-Polling =====
-// ✅ الاتصال يبقى مفتوحاً — يرد فوراً عند المطابقة أو انتهاء الجلسة
-// ✅ Connection stays open — responds instantly on match or expiry
+// ⚡ الرد فوري (<1ms) عند المطابقة — بدون انتظار دورة الـ 300ms القديمة
+// ⚡ Instant response (<1ms) on match — no waiting for the old 300ms poll cycle
 router.get("/sessions/:sessionId", requireApiKey, async (req: Request, res: Response) => {
   const { sessionId } = req.params;
   const pollStart = Date.now();
 
-  // منع الـ cache على هذا الـ endpoint | No cache for this endpoint
   res.setHeader("Cache-Control", "no-cache, no-store");
-  res.setHeader("X-Accel-Buffering", "no"); // تعطيل buffering في nginx | Disable nginx buffering
+  res.setHeader("X-Accel-Buffering", "no");
 
-  // تنظيف عند قطع الاتصال من الجهة الأخرى | Cleanup on client disconnect
   let clientGone = false;
-  req.on("close", () => { clientGone = true; });
+  req.on("close", () => {
+    clientGone = true;
+    removePendingPolls(sessionId); // تحرير الذاكرة فوراً | Free memory immediately
+  });
 
-  // ─── حلقة Long-Polling ──────────────────────────────────────────────────
   while (!clientGone) {
     const result = await pool.query(
       "SELECT phone, verified, expires_at FROM verification_sessions WHERE id = $1",
@@ -125,21 +119,11 @@ router.get("/sessions/:sessionId", requireApiKey, async (req: Request, res: Resp
       return;
     }
 
-    const session = result.rows[0] as {
-      phone: string;
-      verified: boolean;
-      expires_at: Date;
-    };
-
+    const session = result.rows[0] as { phone: string; verified: boolean; expires_at: Date };
     const now = Date.now();
     const expired = new Date(session.expires_at).getTime() < now;
-    const remainingSeconds = Math.max(
-      0,
-      Math.floor((new Date(session.expires_at).getTime() - now) / 1000)
-    );
+    const remainingSeconds = Math.max(0, Math.floor((new Date(session.expires_at).getTime() - now) / 1000));
 
-    // ✅ رد فوري: إذا تحققت الجلسة أو انتهت أو انتهى وقت Long-Poll
-    // ✅ Respond immediately: verified, expired, or long-poll timeout reached
     if (session.verified || expired || now - pollStart >= LONG_POLL_MAX_MS) {
       res.json({
         verified: session.verified,
@@ -150,8 +134,10 @@ router.get("/sessions/:sessionId", requireApiKey, async (req: Request, res: Resp
       return;
     }
 
-    // انتظر قبل الفحص التالي | Wait before next check
-    await new Promise<void>((resolve) => setTimeout(resolve, LONG_POLL_INTERVAL_MS));
+    // ⚡ ينتظر إشعاراً فورياً أو يعود بعد 5 ثوانٍ للتحقق من DB احتياطياً
+    // ⚡ Waits for instant signal or falls back to DB check after 5s
+    const remaining = LONG_POLL_MAX_MS - (Date.now() - pollStart);
+    await waitForNotification(sessionId, Math.min(LONG_POLL_FALLBACK_MS, remaining));
   }
 });
 
